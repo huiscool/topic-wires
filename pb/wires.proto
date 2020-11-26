@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package="github.com/huiscool/topic-wires/pb";
+
+message Message {
+    enum MsgType {
+        UNKNOWN = 0;
+        JOIN = 1;
+        LEAVE = 2;
+        JOIN_REPLY=3;
+    };
+    MsgType msgType = 1;
+    repeated string topics = 2;
+}
