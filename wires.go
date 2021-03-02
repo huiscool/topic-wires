@@ -2,7 +2,6 @@ package wires
 
 import (
 	"context"
-	"fmt"
 	"sync"
 
 	"github.com/gogo/protobuf/proto"
@@ -20,11 +19,12 @@ const (
 )
 
 type TopicWires struct {
-	rw     sync.RWMutex
-	h      host.Host
-	joined map[string]struct{}
-	topics map[string]*PeerSet
-	notif  Notifiee
+	rw      sync.RWMutex
+	h       host.Host
+	joined  map[string]struct{}
+	topics  map[string]*PeerSet
+	notif   Notifiee
+	msghndl TopicMsgHandler
 }
 
 func NewTopicWires(h host.Host) (*TopicWires, error) {
@@ -50,7 +50,11 @@ func (t *TopicWires) Join(topic string) error {
 
 	// send peer
 	for _, peerid := range t.h.Network().Peers() {
-		err := t.sendMsg(peerid, []string{topic}, pb.Message_JOIN)
+		err := t.sendMsg(peerid, &pb.Message{
+			MsgType: pb.Message_JOIN,
+			Topics:  []string{topic},
+			Data:    nil,
+		})
 		if err != nil {
 			// TODO: log
 		}
@@ -71,7 +75,11 @@ func (t *TopicWires) Leave(topic string) error {
 	}
 	for _, p := range neighs.Slice() {
 		go func(p peer.ID) {
-			err := t.sendMsg(p, []string{topic}, pb.Message_LEAVE)
+			err := t.sendMsg(p, &pb.Message{
+				MsgType: pb.Message_LEAVE,
+				Topics:  []string{topic},
+				Data:    nil,
+			})
 			if err != nil {
 				// TODO: log
 			}
@@ -123,12 +131,32 @@ func (t *TopicWires) Close() error {
 	}
 	// send peer
 	for _, peerid := range t.h.Network().Peers() {
-		err := t.sendMsg(peerid, topics, pb.Message_LEAVE)
+		err := t.sendMsg(peerid, &pb.Message{
+			MsgType: pb.Message_LEAVE,
+			Topics:  topics,
+			Data:    nil,
+		})
 		if err != nil {
 			// TODO: log
 		}
 	}
 	return nil
+}
+
+func (t *TopicWires) SendTopicMsg(topic string, p peer.ID, data []byte) error {
+	return t.sendMsg(p, &pb.Message{
+		MsgType: pb.Message_DATA,
+		Topics:  []string{topic},
+		Data:    data,
+	})
+}
+
+type TopicMsgHandler func(topic string, from peer.ID, data []byte)
+
+func (t *TopicWires) SetTopicMsgHandler(tmh TopicMsgHandler) {
+	t.rw.Lock()
+	defer t.rw.Unlock()
+	t.msghndl = tmh
 }
 
 /*===========================================================================*/
@@ -141,11 +169,7 @@ func (t *TopicWires) joinedTopics() []string {
 	return out
 }
 
-func (t *TopicWires) sendMsg(to peer.ID, topics []string, msgType pb.Message_MsgType) error {
-	msg := &pb.Message{
-		MsgType: msgType,
-		Topics:  topics,
-	}
+func (t *TopicWires) sendMsg(to peer.ID, msg *pb.Message) error {
 	msgBin, err := proto.Marshal(msg)
 	if err != nil {
 		return err
@@ -178,7 +202,6 @@ func (t *TopicWires) handleStream(s network.Stream) {
 		return
 	}
 	from := s.Conn().RemotePeer()
-	fmt.Printf("recv msg: %+v\n", msg)
 	switch msg.MsgType {
 	case pb.Message_JOIN:
 		t.handlePeerJoin(from, msg.Topics)
@@ -186,6 +209,8 @@ func (t *TopicWires) handleStream(s network.Stream) {
 		t.handlePeerLeave(from, msg.Topics)
 	case pb.Message_JOIN_REPLY:
 		t.handlePeerJoinReply(from, msg.Topics)
+	case pb.Message_DATA:
+		t.handlePeerData(from, msg.Topics, msg.Data)
 	}
 }
 
@@ -200,7 +225,6 @@ func (t *TopicWires) handlePeerDown(p peer.ID) {
 
 func (t *TopicWires) handlePeerJoin(p peer.ID, topics []string) {
 	t.rw.Lock()
-	defer t.rw.Unlock()
 	var replyTopics = make([]string, 0, len(topics))
 	for _, topic := range topics {
 		ps, ok := t.topics[topic]
@@ -217,7 +241,12 @@ func (t *TopicWires) handlePeerJoin(p peer.ID, topics []string) {
 		replyTopics = append(replyTopics, topic)
 		go t.notif.HandleNeighUp(p, topic)
 	}
-	t.sendMsg(p, replyTopics, pb.Message_JOIN_REPLY)
+	t.rw.Unlock()
+	t.sendMsg(p, &pb.Message{
+		MsgType: pb.Message_JOIN_REPLY,
+		Topics:  replyTopics,
+		Data:    nil,
+	})
 }
 
 func (t *TopicWires) handlePeerLeave(p peer.ID, topics []string) {
@@ -245,6 +274,15 @@ func (t *TopicWires) handlePeerJoinReply(p peer.ID, topics []string) {
 		}
 		ps.Add(p)
 		go t.notif.HandleNeighUp(p, topic)
+	}
+}
+
+func (t *TopicWires) handlePeerData(p peer.ID, topics []string, data []byte) {
+	t.rw.RLock()
+	hndl := t.msghndl
+	t.rw.RUnlock()
+	for _, topic := range topics {
+		go hndl(topic, p, data)
 	}
 }
 
@@ -289,7 +327,12 @@ func (tn *topicWiresNotif) Connected(n network.Network, c network.Conn) {
 		return
 	}
 	go func() {
-		err := t.sendMsg(c.RemotePeer(), t.joinedTopics(), pb.Message_JOIN)
+		// err := t.sendMsg(c.RemotePeer(), t.joinedTopics(), pb.Message_JOIN)
+		err := t.sendMsg(c.RemotePeer(), &pb.Message{
+			MsgType: pb.Message_JOIN,
+			Topics:  t.joinedTopics(),
+			Data:    nil,
+		})
 		if err != nil {
 			// log
 		}

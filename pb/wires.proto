@@ -10,7 +10,9 @@ message Message {
         JOIN = 1;
         LEAVE = 2;
         JOIN_REPLY=3;
+        DATA = 4;
     };
     MsgType msgType = 1;
     repeated string topics = 2;
+    bytes data = 3;
 }
